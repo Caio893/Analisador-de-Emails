@@ -1,0 +1,31 @@
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+
+ARG VITE_API_BASE_URL
+ARG VITE_USE_MOCKS=false
+ARG VITE_API_WITH_CREDENTIALS=true
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+ENV VITE_USE_MOCKS=${VITE_USE_MOCKS}
+ENV VITE_API_WITH_CREDENTIALS=${VITE_API_WITH_CREDENTIALS}
+ENV MAILGUARD_VPS_BUILD=true
+
+RUN npm run build
+
+FROM nginx:1.27-alpine
+
+RUN apk add --no-cache apache2-utils
+
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY docker-entrypoint.d/19-beta-basic-auth.envsh /docker-entrypoint.d/19-beta-basic-auth.envsh
+RUN chmod +x /docker-entrypoint.d/19-beta-basic-auth.envsh
+COPY --from=builder /app/dist/client /usr/share/nginx/html
+
+EXPOSE 8080
+
+CMD ["nginx", "-g", "daemon off;"]

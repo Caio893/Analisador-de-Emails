@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "${BETA_BASIC_AUTH_ENABLED:-false}" in
+  1|true|TRUE|yes|YES|on|ON)
+    : "${BETA_BASIC_AUTH_USERNAME:?BETA_BASIC_AUTH_USERNAME is required when beta auth is enabled}"
+    : "${BETA_BASIC_AUTH_PASSWORD:?BETA_BASIC_AUTH_PASSWORD is required when beta auth is enabled}"
+    htpasswd -bc /etc/nginx/.htpasswd "$BETA_BASIC_AUTH_USERNAME" "$BETA_BASIC_AUTH_PASSWORD" >/dev/null
+    export NGINX_AUTH_BASIC="\"${BETA_BASIC_AUTH_REALM:-MailGuard Closed Beta}\""
+    ;;
+  *)
+    htpasswd -bc /etc/nginx/.htpasswd disabled disabled >/dev/null
+    export NGINX_AUTH_BASIC="off"
+    ;;
+esac

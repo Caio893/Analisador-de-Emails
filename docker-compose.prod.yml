@@ -1,0 +1,130 @@
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    env_file:
+      - ${MAILGUARD_ENV_FILE:-.env.production}
+    ports:
+      - "${CADDY_HTTP_BIND:-80}:80"
+      - "${CADDY_HTTPS_BIND:-443}:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+    image: mailguard-ai-backend
+    restart: unless-stopped
+    env_file:
+      - ${MAILGUARD_ENV_FILE:-.env.production}
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379/0
+      ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
+      RUN_STARTUP_TASKS: "true"
+    ports:
+      - "${BACKEND_BIND:-127.0.0.1:8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os, urllib.parse, urllib.request; host = urllib.parse.urlparse(os.environ.get('BACKEND_URL', 'http://localhost:8000')).netloc or 'localhost:8000'; req = urllib.request.Request('http://127.0.0.1:8000/api/healthz/', headers={'Host': host}); urllib.request.urlopen(req, timeout=5).read()\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  analysis-worker:
+    image: mailguard-ai-backend
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: python manage.py process_email_analysis_queue
+    env_file:
+      - ${MAILGUARD_ENV_FILE:-.env.production}
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379/0
+      ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
+      RUN_STARTUP_TASKS: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend/mailguard-ai-dashboard
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
+        VITE_USE_MOCKS: ${VITE_USE_MOCKS:-false}
+        VITE_API_WITH_CREDENTIALS: ${VITE_API_WITH_CREDENTIALS:-true}
+    image: mailguard-ai-frontend
+    restart: unless-stopped
+    env_file:
+      - ${MAILGUARD_ENV_FILE:-.env.production}
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1:8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file:
+      - ${MAILGUARD_ENV_FILE:-.env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
