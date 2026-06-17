@@ -1,10 +1,36 @@
 # Email Radar / MailGuard AI
 
-Aplicacao full-stack para analise de seguranca de emails do Gmail com IA. O sistema conecta uma conta Google com acesso somente leitura, sincroniza mensagens da inbox e do spam, extrai sinais tecnicos e classifica cada email por nivel de risco.
+---
+
+<p align="left">
+  <img alt="Python" src="https://img.shields.io/badge/PYTHON-3776AB?style=flat-square&logo=python&logoColor=white" />
+  <img alt="Django" src="https://img.shields.io/badge/DJANGO-092E20?style=flat-square&logo=django&logoColor=white" />
+  <img alt="Django REST Framework" src="https://img.shields.io/badge/DRF-B71C1C?style=flat-square&logo=django&logoColor=white" />
+  <img alt="React" src="https://img.shields.io/badge/REACT-20232A?style=flat-square&logo=react&logoColor=61DAFB" />
+  <img alt="TypeScript" src="https://img.shields.io/badge/TYPESCRIPT-3178C6?style=flat-square&logo=typescript&logoColor=white" />
+  <img alt="Vite" src="https://img.shields.io/badge/VITE-646CFF?style=flat-square&logo=vite&logoColor=white" />
+  <img alt="IA" src="https://img.shields.io/badge/IA%20INFERENCE-FF4F8B?style=flat-square&logo=openai&logoColor=white" />
+</p>
+
+<p align="left">
+  <img alt="Gmail API" src="https://img.shields.io/badge/GMAIL%20API-EA4335?style=flat-square&logo=gmail&logoColor=white" />
+  <img alt="OpenAI" src="https://img.shields.io/badge/OPENAI-111111?style=flat-square&logo=openai&logoColor=white" />
+  <img alt="PostgreSQL" src="https://img.shields.io/badge/POSTGRESQL-4169E1?style=flat-square&logo=postgresql&logoColor=white" />
+  <img alt="Valkey" src="https://img.shields.io/badge/VALKEY-CB0000?style=flat-square&logo=redis&logoColor=white" />
+  <img alt="Docker" src="https://img.shields.io/badge/DOCKER-2496ED?style=flat-square&logo=docker&logoColor=white" />
+  <img alt="Caddy" src="https://img.shields.io/badge/CADDY-1F88C0?style=flat-square&logo=caddy&logoColor=white" />
+  <img alt="Nginx" src="https://img.shields.io/badge/NGINX-009639?style=flat-square&logo=nginx&logoColor=white" />
+  <img alt="Security" src="https://img.shields.io/badge/SECURITY-FIRST-FFD43B?style=flat-square&logo=shield&logoColor=black" />
+  <img alt="Production ready" src="https://img.shields.io/badge/PRODUCTION%20READY-22C55E?style=flat-square&logo=checkmarx&logoColor=white" />
+</p>
+
+Aplicacao web full-stack para analise de seguranca de emails do Gmail com painel React, API Django, sincronizacao via Gmail API, heuristicas locais e inferencia com IA.
+
+O projeto foi preparado como entrega publicavel: o frontend roda em `frontend/mailguard-ai-dashboard/`, o backend em `backend/`, a configuracao de producao usa `docker-compose.prod.yml`, e os arquivos reais de ambiente ficam fora do Git por seguranca.
 
 ## Objetivo
 
-O projeto ajuda usuarios a identificar mensagens confiaveis, suspeitas ou perigosas antes de clicar em links, abrir anexos ou responder a golpes. A classificacao combina heuristicas locais com analise avancada via OpenAI, mantendo a validacao final no backend.
+O Email Radar ajuda usuarios a identificar mensagens confiaveis, suspeitas ou perigosas antes de clicar em links, abrir anexos ou responder a golpes. A classificacao combina sinais tecnicos do Gmail com analise avancada via OpenAI, mantendo a validacao final no backend.
 
 ## Funcionalidades
 
@@ -37,17 +63,16 @@ O frontend nunca acessa Gmail ou OpenAI diretamente. Credenciais, tokens OAuth, 
 
 ## Stack
 
-- **React + TypeScript**: interface interativa, tipada e componentizada.
-- **Vite / TanStack Router**: build moderno e roteamento client-side.
-- **TanStack Query**: cache, paginacao, refetch e invalidacao de dados.
-- **Zustand**: estado simples para conta conectada e selecao de email.
-- **Django + Django REST Framework**: API, models, migrations, admin, sessoes e middleware.
-- **PostgreSQL**: armazenamento de contas, emails, metadados e analises.
-- **Valkey**: fila e deduplicacao de analises avancadas.
-- **OpenAI SDK**: inferencia de risco com resposta estruturada.
-- **Gmail API**: leitura de mensagens com permissao minima.
-- **Docker Compose**: ambiente local e producao reproduzivel.
-- **Caddy + Nginx**: proxy reverso publico e servidor estatico do frontend em producao.
+| Camada | Tecnologias | Motivo |
+| --- | --- | --- |
+| Frontend | React, TypeScript, Vite | UI interativa, tipada e rapida para desenvolvimento. |
+| Rotas e estado | TanStack Router, TanStack Query, Zustand | Cache, refetch, paginacao, selecao de email e estado de conta. |
+| Backend | Django, Django REST Framework | API, models, migrations, admin, sessoes e middleware. |
+| Dados | PostgreSQL | Persistencia de contas, emails, metadados e analises. |
+| Fila | Valkey | Processamento assincrono e deduplicacao de analises. |
+| IA | OpenAI Responses API | Inferencia estruturada com classificacao, score e explicacao. |
+| Email | Gmail API + OAuth2 | Leitura de mensagens com permissao minima. |
+| Deploy | Docker Compose, Caddy, Nginx | Ambiente reproduzivel, proxy reverso e frontend estatico em producao. |
 
 ## Pontos tecnicos de destaque
 
