@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+    max-file: ${DOCKER_LOG_MAX_FILE:-3}
+
 services:
   backend:
     build:
@@ -5,6 +11,10 @@ services:
     image: mailguard-ai-backend
     container_name: mailguard_backend
     restart: unless-stopped
+    mem_limit: ${BACKEND_MEM_LIMIT:-512m}
+    cpus: ${BACKEND_CPUS:-0.75}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-256}
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -15,9 +25,9 @@ services:
       OAUTHLIB_INSECURE_TRANSPORT: ${OAUTHLIB_INSECURE_TRANSPORT:-1}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_URL: redis://redis:6379/0
+      VALKEY_HOST: valkey
+      VALKEY_PORT: 6379
+      VALKEY_URL: valkey://valkey:6379/0
       ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
       OPENAI_BULK_MODEL: ${OPENAI_BULK_MODEL:-gpt-4.1-mini}
       OPENAI_RETRY_ATTEMPTS: ${OPENAI_RETRY_ATTEMPTS:-2}
@@ -28,7 +38,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
     healthcheck:
       test:
@@ -47,6 +57,10 @@ services:
       context: ./backend
     container_name: mailguard_analysis_worker
     restart: unless-stopped
+    mem_limit: ${ANALYSIS_WORKER_MEM_LIMIT:-384m}
+    cpus: ${ANALYSIS_WORKER_CPUS:-0.75}
+    pids_limit: ${ANALYSIS_WORKER_PIDS_LIMIT:-128}
+    logging: *default-logging
     command: python manage.py process_email_analysis_queue
     env_file:
       - .env
@@ -56,9 +70,9 @@ services:
       OAUTHLIB_INSECURE_TRANSPORT: ${OAUTHLIB_INSECURE_TRANSPORT:-1}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_URL: redis://redis:6379/0
+      VALKEY_HOST: valkey
+      VALKEY_PORT: 6379
+      VALKEY_URL: valkey://valkey:6379/0
       ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
       OPENAI_BULK_MODEL: ${OPENAI_BULK_MODEL:-gpt-4.1-mini}
       OPENAI_RETRY_ATTEMPTS: ${OPENAI_RETRY_ATTEMPTS:-2}
@@ -68,8 +82,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings'); import django; django.setup(); from api.services.analysis_queue import valkey_client; client = valkey_client(); client.ping(); client.close()\"",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   frontend:
     build:
@@ -77,11 +101,17 @@ services:
       dockerfile: ../Dockerfile
     container_name: mailguard_frontend
     restart: unless-stopped
+    mem_limit: ${FRONTEND_DEV_MEM_LIMIT:-768m}
+    cpus: ${FRONTEND_DEV_CPUS:-1.0}
+    pids_limit: ${FRONTEND_DEV_PIDS_LIMIT:-256}
+    logging: *default-logging
     env_file:
       - .env
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api}
       VITE_USE_MOCKS: ${VITE_USE_MOCKS:-false}
+      VITE_API_TIMEOUT_MS: ${VITE_API_TIMEOUT_MS:-60000}
+      VITE_EMAIL_SYNC_INTERVAL_MS: ${VITE_EMAIL_SYNC_INTERVAL_MS:-300000}
     volumes:
       - ./frontend/mailguard-ai-dashboard:/app
       - frontend_node_modules:/app/node_modules
@@ -104,6 +134,10 @@ services:
     image: postgres:16
     container_name: mailguard_postgres
     restart: unless-stopped
+    mem_limit: ${POSTGRES_MEM_LIMIT:-512m}
+    cpus: ${POSTGRES_CPUS:-0.75}
+    pids_limit: ${POSTGRES_PIDS_LIMIT:-256}
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mailguard}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -118,14 +152,26 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7
-    container_name: mailguard_redis
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: mailguard_valkey
     restart: unless-stopped
+    mem_limit: ${VALKEY_MEM_LIMIT:-128m}
+    cpus: ${VALKEY_CPUS:-0.25}
+    pids_limit: ${VALKEY_PIDS_LIMIT:-64}
+    logging: *default-logging
+    command:
+      [
+        "valkey-server",
+        "--maxmemory",
+        "${VALKEY_MAXMEMORY:-64mb}",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

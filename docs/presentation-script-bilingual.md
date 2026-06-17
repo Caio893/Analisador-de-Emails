@@ -27,7 +27,7 @@ PostgreSQL
   |
   | suporte opcional a fila
   v
-Redis / processador de analise
+Valkey / processador de analise
   |
   | APIs externas
   v
@@ -163,7 +163,7 @@ Essa camada intermediaria e util porque o navegador acessa um unico site em prod
 
 Pergunta: Por que usar um proxy reverso?
 
-Resposta: Porque ele permite expor publicamente apenas as portas 80 e 443, mantendo servidor, interface, Postgres e Redis em portas internas ou locais. Ele tambem centraliza roteamento e HTTPS.
+Resposta: Porque ele permite expor publicamente apenas as portas 80 e 443, mantendo servidor, interface, Postgres e Valkey em portas internas ou locais. Ele tambem centraliza roteamento e HTTPS.
 
 Pergunta: Por que a interface usa Nginx em producao em vez do Vite?
 
@@ -207,7 +207,7 @@ A interface nao deve fazer essas tarefas porque codigo no navegador pode ser ins
 ## Estrutura do Servidor
 
 - `backend/config`: configuracao principal do Django.
-  - `settings.py`: variaveis de ambiente, banco de dados, CORS, CSRF, seguranca, OAuth, OpenAI e Redis.
+  - `settings.py`: variaveis de ambiente, banco de dados, CORS, CSRF, seguranca, OAuth, OpenAI e Valkey.
   - `urls.py`: rotas `/admin/` e `/api/`.
   - `asgi.py` e `wsgi.py`: pontos de entrada do servidor.
 - `backend/api`: aplicacao principal.
@@ -249,7 +249,7 @@ A interface nao deve fazer essas tarefas porque codigo no navegador pode ser ins
 
 O servidor trata mensagens como objetos `EmailRecord`. Ele trata usuarios nesta versao como contas `GoogleAccount` conectadas e sessoes do Django, nao como um sistema completo de usuarios proprio.
 
-O projeto nao implementa agendamentos de atendimento. A parte mais parecida com uma execucao assincroma e a fila/processador de analise usando Redis e `process_email_analysis_queue.py`.
+O projeto nao implementa agendamentos de atendimento. A parte mais parecida com uma execucao assincroma e a fila/processador de analise usando Valkey e `process_email_analysis_queue.py`.
 
 O projeto tambem nao implementa comandos administrativos por WhatsApp. As operacoes administrativas existem via Django Admin e endpoints da API.
 
@@ -431,7 +431,7 @@ Nao existe integracao com WhatsApp no codigo atual. Se perguntarem, a resposta c
 - `SECURE_CONTENT_TYPE_NOSNIFF`, `SECURE_REFERRER_POLICY`, HSTS e `X_FRAME_OPTIONS = "DENY"` estao configurados.
 - Autenticacao basica da beta fechada existe em `BetaBasicAuthMiddleware`.
 - Docker de producao deixa servidor/interface em localhost por padrao e expoe apenas Caddy em 80/443.
-- PostgreSQL e Redis nao ficam publicos no compose de producao.
+- PostgreSQL e Valkey nao ficam publicos no compose de producao.
 - O `state` do OAuth do Google e verificado no callback.
 - Tokens OAuth nao sao enviados a interface.
 - O corpo do email e exibido em iframe com sandbox e no-referrer.

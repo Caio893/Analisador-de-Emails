@@ -35,7 +35,9 @@ export function AppSidebar() {
       ? "Nenhum email nesta pasta."
       : analyzeFolder.data.eligible === 0
         ? `${analyzeFolder.data.skippedAlreadyAnalyzed} emails ja estavam analisados.`
-        : analyzeFolder.data.localFallback > 0
+        : (analyzeFolder.data.queued ?? 0) > 0
+          ? `${analyzeFolder.data.queued} emails enviados para a fila da IA.`
+          : analyzeFolder.data.localFallback > 0
           ? `${analyzeFolder.data.aiAnalyzed} novos avaliados pela IA; ${analyzeFolder.data.localFallback} ficaram em triagem local.`
           : analyzeFolder.data.failed > 0
             ? `${analyzeFolder.data.aiAnalyzed} novos avaliados pela IA; ${analyzeFolder.data.failed} falharam.`

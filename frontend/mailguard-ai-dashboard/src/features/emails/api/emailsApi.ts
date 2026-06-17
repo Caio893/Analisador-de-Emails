@@ -95,21 +95,28 @@ export async function fetchFolderCounts(): Promise<Record<Folder, number>> {
   };
 }
 
-export async function syncEmails(
-  folders: Folder[],
-): Promise<{ synced: number; analyzed: number; localAnalyzed?: number; queued?: number }> {
+export async function syncEmails(folders: Folder[]): Promise<{
+  synced: number;
+  analyzed: number;
+  localAnalyzed?: number;
+  queued?: number;
+  removed?: number;
+}> {
   if (USE_MOCKS) {
     await delay(120);
     return { synced: MOCK_EMAILS.length, analyzed: 0, localAnalyzed: MOCK_EMAILS.length };
   }
 
-  return apiFetch<{ synced: number; analyzed: number; localAnalyzed?: number; queued?: number }>(
-    "/emails/sync/",
-    {
-      method: "POST",
-      body: JSON.stringify({ folders }),
-    },
-  );
+  return apiFetch<{
+    synced: number;
+    analyzed: number;
+    localAnalyzed?: number;
+    queued?: number;
+    removed?: number;
+  }>("/emails/sync/", {
+    method: "POST",
+    body: JSON.stringify({ folders }),
+  });
 }
 
 export async function analyzeFolder(folder: Folder): Promise<AnalyzeFolderResult> {

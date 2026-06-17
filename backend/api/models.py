@@ -12,6 +12,8 @@ class GoogleAccount(models.Model):
     scopes = models.JSONField(default=list, blank=True)
     token_expiry = models.DateTimeField(null=True, blank=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
+    gmail_history_id = models.CharField(max_length=255, blank=True)
+    gmail_watch_expiration = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -36,6 +38,8 @@ class EmailRecord(models.Model):
     subject = models.CharField(max_length=500, blank=True)
     snippet = models.TextField(blank=True)
     body = models.TextField(blank=True)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    gmail_history_id = models.CharField(max_length=255, blank=True)
     has_attachments = models.BooleanField(default=False)
     attachment_count = models.PositiveSmallIntegerField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
@@ -106,12 +110,24 @@ class EmailAnalysis(models.Model):
         SUSPICIOUS = "suspicious", "Suspicious"
         DANGEROUS = "dangerous", "Dangerous"
 
+    class Status(models.TextChoices):
+        LOCAL = "local", "Local heuristic"
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
     email = models.OneToOneField(EmailRecord, on_delete=models.CASCADE, related_name="analysis")
     risk = models.CharField(max_length=16, choices=Risk.choices)
     risk_score = models.PositiveSmallIntegerField(default=0)
     reason = models.TextField(blank=True)
     signals = models.JSONField(default=list, blank=True)
     model = models.CharField(max_length=120, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.COMPLETED)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    prompt_version = models.CharField(max_length=64, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    last_error = models.TextField(blank=True)
     analyzed_at = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

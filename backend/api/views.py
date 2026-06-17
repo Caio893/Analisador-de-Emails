@@ -10,8 +10,8 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import EmailRecord, GoogleAccount, TrustedSenderRule
-from .serializers import EmailRecordSerializer
+from .models import EmailAnalysis, EmailRecord, GoogleAccount, TrustedSenderRule
+from .serializers import EmailRecordListSerializer, EmailRecordSerializer
 from .services.gmail import (
     EmailDisplayContent,
     build_google_auth_url,
@@ -20,6 +20,7 @@ from .services.gmail import (
     revoke_google_token,
     sync_account_emails,
 )
+from .services.analysis_queue import enqueue_email_analysis
 from .services.openai_analysis import analyze_email, analyze_email_locally
 from .services.trusted_senders import create_trusted_sender_rule, trusted_sender_rule_for_email
 
@@ -179,7 +180,11 @@ class EmailAnalyzeView(APIView):
             .filter(account=account, folder=folder, hidden_at__isnull=True)
             .order_by("-received_at")
         )
-        queryset = folder_queryset.filter(Q(analysis__isnull=True) | Q(analysis__model="local-heuristic"))
+        queryset = folder_queryset.filter(
+            Q(analysis__isnull=True)
+            | Q(analysis__model="local-heuristic")
+            | Q(analysis__status=EmailAnalysis.Status.FAILED)
+        ).exclude(analysis__status__in=[EmailAnalysis.Status.QUEUED, EmailAnalysis.Status.RUNNING])
 
         total = folder_queryset.count()
         eligible = queryset.count()
@@ -188,7 +193,30 @@ class EmailAnalyzeView(APIView):
         local_fallback = 0
         trusted = 0
         failed = 0
+        queued = 0
         errors = []
+
+        if settings.ANALYSIS_QUEUE_ENABLED:
+            for email in queryset.iterator():
+                if enqueue_email_analysis(email):
+                    queued += 1
+
+            return Response(
+                {
+                    "account": account.email,
+                    "folder": folder,
+                    "total": total,
+                    "eligible": eligible,
+                    "skippedAlreadyAnalyzed": skipped_already_analyzed,
+                    "analyzed": 0,
+                    "aiAnalyzed": 0,
+                    "localFallback": 0,
+                    "trusted": 0,
+                    "queued": queued,
+                    "failed": eligible - queued,
+                    "errors": errors,
+                }
+            )
 
         for email in queryset.iterator():
             try:
@@ -223,6 +251,7 @@ class EmailAnalyzeView(APIView):
                 "aiAnalyzed": ai_analyzed,
                 "localFallback": local_fallback,
                 "trusted": trusted,
+                "queued": queued,
                 "failed": failed,
                 "errors": errors[:5],
             }
@@ -268,7 +297,7 @@ class EmailListView(APIView):
         items = queryset[start : start + page_size]
         return Response(
             {
-                "items": EmailRecordSerializer(items, many=True).data,
+                "items": EmailRecordListSerializer(items, many=True).data,
                 "page": page,
                 "pageSize": page_size,
                 "total": total,
@@ -400,7 +429,9 @@ class SummaryView(APIView):
 
         return Response(
             {
-                "analyzedToday": emails.filter(analysis__analyzed_at__date=today).count(),
+                "analyzedToday": emails.filter(analysis__analyzed_at__date=today)
+                .exclude(analysis__status__in=[EmailAnalysis.Status.QUEUED, EmailAnalysis.Status.RUNNING])
+                .count(),
                 "spamDetected": emails.filter(folder=EmailRecord.Folder.SPAM).count(),
                 "suspicious": emails.filter(analysis__risk="suspicious").count(),
                 "riskRate": round((risky / max(total, 1)) * 100),

@@ -3,8 +3,12 @@ import time
 from django.core.management.base import BaseCommand
 
 from api.models import EmailRecord
-from api.services.analysis_queue import mark_email_analysis_done, pop_email_analysis
-from api.services.openai_analysis import analyze_email_locally
+from api.services.analysis_queue import (
+    mark_email_analysis_done,
+    mark_email_analysis_running,
+    pop_email_analysis,
+)
+from api.services.openai_analysis import analyze_email
 
 
 class Command(BaseCommand):
@@ -18,7 +22,13 @@ class Command(BaseCommand):
         self.stdout.write("MailGuard analysis worker started.")
 
         while True:
-            email_id = pop_email_analysis()
+            try:
+                email_id = pop_email_analysis()
+            except Exception as exc:
+                self.stderr.write(f"Failed to read analysis queue: {exc}")
+                time.sleep(5)
+                continue
+
             if email_id is None:
                 if run_once:
                     return
@@ -26,8 +36,15 @@ class Command(BaseCommand):
 
             try:
                 email = EmailRecord.objects.select_related("analysis").get(pk=email_id)
-                analyze_email_locally(email)
-                self.stdout.write(f"Applied local analysis to queued email {email_id}.")
+                if email.hidden_at:
+                    self.stdout.write(f"Skipped hidden email {email_id}.")
+                    continue
+                mark_email_analysis_running(email)
+                email = EmailRecord.objects.select_related("analysis").get(pk=email_id)
+                analysis = analyze_email(email, force=True, bulk=True)
+                self.stdout.write(
+                    f"Applied {analysis.model or 'advanced'} analysis to queued email {email_id}."
+                )
             except EmailRecord.DoesNotExist:
                 self.stdout.write(f"Skipped missing email {email_id}.")
             except Exception as exc:

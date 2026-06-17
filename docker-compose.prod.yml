@@ -1,7 +1,17 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${DOCKER_LOG_MAX_SIZE:-10m}
+    max-file: ${DOCKER_LOG_MAX_FILE:-3}
+
 services:
   caddy:
     image: caddy:2.8-alpine
     restart: unless-stopped
+    mem_limit: ${CADDY_MEM_LIMIT:-128m}
+    cpus: ${CADDY_CPUS:-0.25}
+    pids_limit: ${CADDY_PIDS_LIMIT:-64}
+    logging: *default-logging
     env_file:
       - ${MAILGUARD_ENV_FILE:-.env.production}
     ports:
@@ -28,14 +38,18 @@ services:
       context: ./backend
     image: mailguard-ai-backend
     restart: unless-stopped
+    mem_limit: ${BACKEND_MEM_LIMIT:-512m}
+    cpus: ${BACKEND_CPUS:-0.75}
+    pids_limit: ${BACKEND_PIDS_LIMIT:-256}
+    logging: *default-logging
     env_file:
       - ${MAILGUARD_ENV_FILE:-.env.production}
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_URL: redis://redis:6379/0
+      VALKEY_HOST: valkey
+      VALKEY_PORT: 6379
+      VALKEY_URL: valkey://valkey:6379/0
       ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
       RUN_STARTUP_TASKS: "true"
     ports:
@@ -43,7 +57,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
     healthcheck:
       test:
@@ -61,22 +75,36 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
+    mem_limit: ${ANALYSIS_WORKER_MEM_LIMIT:-384m}
+    cpus: ${ANALYSIS_WORKER_CPUS:-0.75}
+    pids_limit: ${ANALYSIS_WORKER_PIDS_LIMIT:-128}
+    logging: *default-logging
     command: python manage.py process_email_analysis_queue
     env_file:
       - ${MAILGUARD_ENV_FILE:-.env.production}
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_URL: redis://redis:6379/0
+      VALKEY_HOST: valkey
+      VALKEY_PORT: 6379
+      VALKEY_URL: valkey://valkey:6379/0
       ANALYSIS_QUEUE_ENABLED: ${ANALYSIS_QUEUE_ENABLED:-true}
       RUN_STARTUP_TASKS: "false"
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings'); import django; django.setup(); from api.services.analysis_queue import valkey_client; client = valkey_client(); client.ping(); client.close()\"",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   frontend:
     build:
@@ -86,8 +114,14 @@ services:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL}
         VITE_USE_MOCKS: ${VITE_USE_MOCKS:-false}
         VITE_API_WITH_CREDENTIALS: ${VITE_API_WITH_CREDENTIALS:-true}
+        VITE_API_TIMEOUT_MS: ${VITE_API_TIMEOUT_MS:-60000}
+        VITE_EMAIL_SYNC_INTERVAL_MS: ${VITE_EMAIL_SYNC_INTERVAL_MS:-300000}
     image: mailguard-ai-frontend
     restart: unless-stopped
+    mem_limit: ${FRONTEND_MEM_LIMIT:-128m}
+    cpus: ${FRONTEND_CPUS:-0.25}
+    pids_limit: ${FRONTEND_PIDS_LIMIT:-64}
+    logging: *default-logging
     env_file:
       - ${MAILGUARD_ENV_FILE:-.env.production}
     ports:
@@ -105,6 +139,10 @@ services:
   postgres:
     image: postgres:16
     restart: unless-stopped
+    mem_limit: ${POSTGRES_MEM_LIMIT:-512m}
+    cpus: ${POSTGRES_CPUS:-0.75}
+    pids_limit: ${POSTGRES_PIDS_LIMIT:-256}
+    logging: *default-logging
     env_file:
       - ${MAILGUARD_ENV_FILE:-.env.production}
     volumes:
@@ -115,11 +153,23 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7
+  valkey:
+    image: valkey/valkey:8-alpine
     restart: unless-stopped
+    mem_limit: ${VALKEY_MEM_LIMIT:-128m}
+    cpus: ${VALKEY_CPUS:-0.25}
+    pids_limit: ${VALKEY_PIDS_LIMIT:-64}
+    logging: *default-logging
+    command:
+      [
+        "valkey-server",
+        "--maxmemory",
+        "${VALKEY_MAXMEMORY:-64mb}",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

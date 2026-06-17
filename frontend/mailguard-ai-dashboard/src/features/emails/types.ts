@@ -8,7 +8,7 @@ export interface Email {
   fromEmail: string;
   subject: string;
   preview: string;
-  body: string;
+  body?: string;
   displayBodyHtml?: string;
   displayBodyText?: string;
   displayBodySource?: "gmail-html" | "gmail-text" | "gmail" | "stored";
@@ -53,6 +53,7 @@ export interface AnalyzeFolderResult {
   aiAnalyzed: number;
   localFallback: number;
   trusted: number;
+  queued?: number;
   failed: number;
   errors: Array<{
     emailId: string;

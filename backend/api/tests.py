@@ -10,6 +10,7 @@ from api.models import EmailAnalysis, EmailRecord, GoogleAccount, TrustedSenderR
 from api.services.gmail import (
     EmailDisplayContent,
     GMAIL_READONLY_SCOPE,
+    GmailHistoryLimitExceeded,
     build_google_auth_url,
     extract_display_content_from_payload,
     parse_gmail_message,
@@ -232,27 +233,31 @@ class GmailSyncTests(TestCase):
             scopes=["https://www.googleapis.com/auth/gmail.readonly"],
         )
 
-    @override_settings(OPENAI_API_KEY="test-key", OPENAI_ANALYSIS_ENABLED=True)
-    def test_sync_uses_local_analysis_without_calling_openai(self):
-        message = {
-            "id": "gmail-sync-local",
-            "threadId": "thread-sync-local",
-            "labelIds": ["INBOX"],
-            "snippet": "Weekly update",
+    def gmail_message(self, gmail_id: str, labels: list[str], subject: str = "Weekly update") -> dict:
+        return {
+            "id": gmail_id,
+            "threadId": f"thread-{gmail_id}",
+            "labelIds": labels,
+            "snippet": subject,
             "internalDate": "1700000000000",
             "payload": {
                 "headers": [
                     {"name": "From", "value": "Alice <alice@example.com>"},
-                    {"name": "Subject", "value": "Weekly update"},
+                    {"name": "Subject", "value": subject},
                 ],
                 "mimeType": "text/plain",
                 "body": {"data": encoded("No action required.")},
             },
         }
 
+    @override_settings(OPENAI_API_KEY="test-key", OPENAI_ANALYSIS_ENABLED=True)
+    def test_sync_uses_local_analysis_without_calling_openai(self):
+        message = self.gmail_message("gmail-sync-local", ["INBOX"])
+
         with (
             patch("api.services.gmail.build_gmail_service", return_value=object()),
-            patch("api.services.gmail.iter_messages", return_value=[message]),
+            patch("api.services.gmail.list_message_refs", return_value=[{"id": "gmail-sync-local"}]),
+            patch("api.services.gmail.batch_get_messages", return_value=[message]),
             patch("api.services.openai_analysis.create_response_with_retry") as openai_call,
         ):
             result = sync_account_emails(self.account, folders=[EmailRecord.Folder.INBOX])
@@ -264,6 +269,134 @@ class GmailSyncTests(TestCase):
 
         email = EmailRecord.objects.select_related("analysis").get(gmail_id="gmail-sync-local")
         self.assertEqual(email.analysis.model, "local-heuristic")
+
+    def test_full_sync_removes_local_messages_missing_from_current_folder(self):
+        old_email = EmailRecord.objects.create(
+            account=self.account,
+            gmail_id="gmail-old-local",
+            folder=EmailRecord.Folder.INBOX,
+            from_email="old@example.com",
+            subject="Old local email",
+            received_at=timezone.now(),
+        )
+        message = self.gmail_message("gmail-current", ["INBOX"], subject="Current email")
+
+        with (
+            patch("api.services.gmail.build_gmail_service", return_value=object()),
+            patch("api.services.gmail.list_message_refs", return_value=[{"id": "gmail-current"}]),
+            patch("api.services.gmail.batch_get_messages", return_value=[message]),
+        ):
+            result = sync_account_emails(self.account, folders=[EmailRecord.Folder.INBOX])
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(EmailRecord.objects.filter(pk=old_email.pk).exists())
+        self.assertTrue(EmailRecord.objects.filter(gmail_id="gmail-current").exists())
+
+    def test_incremental_sync_removes_message_that_left_requested_folder(self):
+        self.account.gmail_history_id = "100"
+        self.account.save(update_fields=["gmail_history_id", "updated_at"])
+        old_email = EmailRecord.objects.create(
+            account=self.account,
+            gmail_id="gmail-archived",
+            folder=EmailRecord.Folder.INBOX,
+            from_email="old@example.com",
+            subject="Archived email",
+            received_at=timezone.now(),
+        )
+        archived_message = self.gmail_message("gmail-archived", ["IMPORTANT"])
+
+        with (
+            patch("api.services.gmail.build_gmail_service", return_value=object()),
+            patch("api.services.gmail.history_message_ids", return_value=(["gmail-archived"], "101")),
+            patch("api.services.gmail.batch_get_messages", return_value=[archived_message]),
+            patch("api.services.gmail.list_message_refs", return_value=[]),
+        ):
+            result = sync_account_emails(self.account, folders=[EmailRecord.Folder.INBOX])
+
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(EmailRecord.objects.filter(pk=old_email.pk).exists())
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.gmail_history_id, "101")
+
+    def test_incremental_sync_moves_message_between_requested_folders(self):
+        self.account.gmail_history_id = "100"
+        self.account.save(update_fields=["gmail_history_id", "updated_at"])
+        email = EmailRecord.objects.create(
+            account=self.account,
+            gmail_id="gmail-moved",
+            folder=EmailRecord.Folder.INBOX,
+            from_email="old@example.com",
+            subject="Moved email",
+            received_at=timezone.now(),
+        )
+        spam_message = self.gmail_message("gmail-moved", ["SPAM"], subject="Moved email")
+
+        with (
+            patch("api.services.gmail.build_gmail_service", return_value=object()),
+            patch("api.services.gmail.history_message_ids", return_value=(["gmail-moved"], "101")),
+            patch("api.services.gmail.batch_get_messages", return_value=[spam_message]),
+        ):
+            result = sync_account_emails(
+                self.account,
+                folders=[EmailRecord.Folder.INBOX, EmailRecord.Folder.SPAM],
+            )
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["removed"], 0)
+        email.refresh_from_db()
+        self.assertEqual(email.folder, EmailRecord.Folder.SPAM)
+
+    def test_incremental_sync_reconciles_current_folder_when_history_has_no_ids(self):
+        self.account.gmail_history_id = "100"
+        self.account.save(update_fields=["gmail_history_id", "updated_at"])
+        old_email = EmailRecord.objects.create(
+            account=self.account,
+            gmail_id="gmail-stale",
+            folder=EmailRecord.Folder.INBOX,
+            from_email="old@example.com",
+            subject="Stale email",
+            received_at=timezone.now(),
+        )
+        current_message = self.gmail_message("gmail-current", ["INBOX"], subject="Current email")
+
+        with (
+            patch("api.services.gmail.build_gmail_service", return_value=object()),
+            patch("api.services.gmail.history_message_ids", return_value=([], "101")),
+            patch("api.services.gmail.list_message_refs", return_value=[{"id": "gmail-current"}]),
+            patch("api.services.gmail.batch_get_messages", return_value=[current_message]),
+        ):
+            result = sync_account_emails(self.account, folders=[EmailRecord.Folder.INBOX])
+
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(EmailRecord.objects.filter(pk=old_email.pk).exists())
+        self.assertTrue(EmailRecord.objects.filter(gmail_id="gmail-current").exists())
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.gmail_history_id, "101")
+
+    def test_sync_falls_back_to_limited_full_sync_when_history_is_too_large(self):
+        self.account.gmail_history_id = "100"
+        self.account.save(update_fields=["gmail_history_id", "updated_at"])
+        message = self.gmail_message("gmail-current", ["INBOX"], subject="Current email")
+
+        with (
+            patch("api.services.gmail.build_gmail_service", return_value=object()),
+            patch(
+                "api.services.gmail.history_message_ids",
+                side_effect=GmailHistoryLimitExceeded("too many changes"),
+            ),
+            patch("api.services.gmail.list_message_refs", return_value=[{"id": "gmail-current"}]),
+            patch("api.services.gmail.batch_get_messages", return_value=[message]),
+            patch("api.services.gmail.current_mailbox_history_id", return_value="200"),
+        ):
+            result = sync_account_emails(self.account, folders=[EmailRecord.Folder.INBOX])
+
+        self.assertEqual(result["synced"], 1)
+        self.assertTrue(EmailRecord.objects.filter(gmail_id="gmail-current").exists())
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.gmail_history_id, "200")
 
 
 class OpenAIAnalysisTests(TestCase):
@@ -305,21 +438,30 @@ class OpenAIAnalysisTests(TestCase):
         self.assertEqual(result.model, "gpt-test")
 
     @override_settings(GMAIL_BODY_CHAR_LIMIT=0)
-    def test_openai_payload_is_minimal_and_sends_full_stored_body_when_unlimited(self):
+    def test_openai_payload_is_compact_and_sends_security_signals(self):
         self.email.metadata = {
             "sender_domain": "example.com",
             "links": ["https://example.com/reset"],
+            "link_count": 1,
+            "link_domains": ["example.com"],
+            "attachment_filenames": ["invoice.pdf"],
             "authentication_results": "spf=pass",
         }
         self.email.body = "abcdefghijklmnop"
 
         payload = build_openai_analysis_payload(self.email)
 
-        self.assertEqual(set(payload.keys()), {"folder", "subject", "sender", "domain", "body"})
+        self.assertEqual(
+            set(payload.keys()),
+            {"folder", "subject", "sender", "domain", "links", "attachments", "auth", "body"},
+        )
         self.assertEqual(payload["subject"], "Weekly security update")
         self.assertEqual(payload["sender"], {"name": "Security Team", "email": "security@example.com"})
         self.assertEqual(payload["domain"], "example.com")
         self.assertEqual(payload["body"], "abcdefghijklmnop")
+        self.assertEqual(payload["links"], {"count": 1, "domains": ["example.com"]})
+        self.assertEqual(payload["attachments"]["filenames"], ["invoice.pdf"])
+        self.assertEqual(payload["auth"]["authentication_results"], "spf=pass")
         self.assertNotIn("metadata", payload)
         self.assertNotIn("gmail_id", payload)
 
@@ -509,6 +651,7 @@ class BetaBasicAuthTests(TestCase):
         self.assertEqual(response.json(), {"status": "ok"})
 
 
+@override_settings(ANALYSIS_QUEUE_ENABLED=False)
 class EmailApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -762,6 +905,30 @@ class EmailApiTests(TestCase):
         self.assertEqual(payload["eligible"], 0)
         self.assertEqual(payload["skippedAlreadyAnalyzed"], 1)
         self.assertEqual(payload["analyzed"], 0)
+        analyze.assert_not_called()
+
+    @override_settings(ANALYSIS_QUEUE_ENABLED=True)
+    def test_analyze_endpoint_enqueues_when_queue_enabled(self):
+        self.safe_email.analysis.model = "local-heuristic"
+        self.safe_email.analysis.save(update_fields=["model"])
+
+        with (
+            patch("api.views.enqueue_email_analysis", return_value=True) as enqueue,
+            patch("api.views.analyze_email") as analyze,
+        ):
+            response = self.client.post(
+                "/api/emails/analyze/",
+                {"folder": "inbox"},
+                format="json",
+                HTTP_X_MAILGUARD_ACCOUNT=self.account.email,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["eligible"], 1)
+        self.assertEqual(payload["queued"], 1)
+        self.assertEqual(payload["analyzed"], 0)
+        enqueue.assert_called_once()
         analyze.assert_not_called()
 
     def test_analyze_endpoint_uses_local_fallback_instead_of_500_for_email_errors(self):

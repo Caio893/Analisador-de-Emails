@@ -1,86 +1,80 @@
 # Email Radar / MailGuard AI
 
-![Django](https://img.shields.io/badge/Django-REST-0C4B33?style=for-the-badge&logo=django)
-![React](https://img.shields.io/badge/React-TypeScript-149ECA?style=for-the-badge&logo=react)
-![OpenAI](https://img.shields.io/badge/OpenAI-AI%20Analysis-111827?style=for-the-badge&logo=openai)
-![Gmail](https://img.shields.io/badge/Gmail-Readonly%20OAuth-EA4335?style=for-the-badge&logo=gmail)
-![Docker](https://img.shields.io/badge/Docker-Production%20Ready-2496ED?style=for-the-badge&logo=docker)
+Aplicacao full-stack para analise de seguranca de emails do Gmail com IA. O sistema conecta uma conta Google com acesso somente leitura, sincroniza mensagens da inbox e do spam, extrai sinais tecnicos e classifica cada email por nivel de risco.
 
-Plataforma full-stack de segurança para Gmail que sincroniza mensagens com acesso somente leitura, classifica riscos de phishing/spam/golpes com IA e exibe uma explicação clara para o usuário antes que ele clique em algo perigoso.
+## Objetivo
 
-Este repositório foi preparado como projeto público de portfólio: ele demonstra arquitetura real, integração com APIs externas, cuidado com privacidade, conteinerização, fallback local de IA e uma interface moderna orientada a produto.
+O projeto ajuda usuarios a identificar mensagens confiaveis, suspeitas ou perigosas antes de clicar em links, abrir anexos ou responder a golpes. A classificacao combina heuristicas locais com analise avancada via OpenAI, mantendo a validacao final no backend.
 
-## O Que Chama Atenção
-
-- **Produto completo, não apenas CRUD:** o sistema resolve um problema real de segurança, com fluxo OAuth, sincronização Gmail, análise de risco, painel visual e ações do usuário.
-- **Segurança como requisito de arquitetura:** segredos ficam no backend, tokens OAuth são criptografados em repouso e o frontend nunca recebe chaves do Google ou da OpenAI.
-- **IA com fallback confiável:** quando a API de IA falha, não há tela quebrada; o backend usa heurísticas locais para manter uma classificação preliminar.
-- **Experiência de avaliação simples:** o frontend suporta modo mock para demonstração visual sem conectar uma conta real.
-- **Deploy pensado para produção:** stack com Django, React/Vite, PostgreSQL, Redis, Nginx e Caddy com HTTPS automatizado.
-
-## Principais Funcionalidades
+## Funcionalidades
 
 - Login com Google OAuth usando apenas o escopo `gmail.readonly`.
-- Sincronização de mensagens da caixa de entrada e spam.
-- Classificação de risco em quatro níveis: confiável, levemente confiável, suspeito e perigoso.
-- Pontuação de risco de 0 a 100 com justificativa em português.
-- Análise de phishing, spam, golpes, spoofing, malware, anexos perigosos, links e inconsistências de domínio.
-- Lista paginada de emails com busca por remetente, assunto, resumo e corpo.
-- Painel de leitura com explicação da IA e sinais detectados.
-- Regras de remetente ou domínio confiável para reduzir falsos positivos.
-- Revogação de token OAuth e exclusão dos dados locais da conta.
-- Fila opcional com Redis para processamento assíncrono de análises.
-- Configuração de beta fechada com Basic Auth, CORS/CSRF e cookies seguros.
+- Sincronizacao de emails da inbox e spam via Gmail API.
+- Extracao de remetente, dominio, assunto, corpo, links, anexos, labels e headers relevantes.
+- Classificacao em `trusted`, `slightly_trusted`, `suspicious` e `dangerous`.
+- Score de risco, explicacao em portugues e sinais observados.
+- Analise local de fallback quando a IA esta indisponivel.
+- Analise avancada sob demanda com resposta estruturada por JSON Schema.
+- Cache por hash de conteudo para evitar reanalises desnecessarias.
+- Fila opcional com Valkey para processamento assincrono.
+- Regras de remetente ou dominio confiavel, sem ignorar spam ou anexos perigosos.
+- Preview seguro de email em iframe com sandbox.
+- Deploy com Docker Compose, PostgreSQL, Valkey, Caddy e Nginx.
 
 ## Arquitetura
 
-```mermaid
-flowchart LR
-    U["Usuário"] --> F["Frontend React + Vite"]
-    F --> A["API Django REST"]
-    A --> DB["PostgreSQL"]
-    A --> R["Redis / fila opcional"]
-    A --> G["Gmail API readonly"]
-    A --> O["OpenAI Responses API"]
-    C["Caddy HTTPS"] --> F
-    C --> A
-    N["Nginx produção"] --> F
-```
-
-## Stack Técnica
-
-- **Backend:** Django, Django REST Framework, PostgreSQL, Redis, Cryptography/Fernet.
-- **Frontend:** React, TypeScript, Vite, TanStack Router, TanStack Query, Zustand, Radix UI, Lucide, Tailwind CSS.
-- **IA:** OpenAI Responses API com JSON Schema estrito e fallback heurístico local.
-- **Integrações:** Google OAuth 2.0 e Gmail API com acesso somente leitura.
-- **Infra:** Docker Compose, Caddy como proxy reverso, Nginx para servir o frontend em produção.
-
-## Estrutura do Projeto
-
 ```text
-backend/                         API Django, modelos, serviços e segurança
-frontend/mailguard-ai-dashboard/ Frontend React/TypeScript
-caddy/                           Proxy reverso público para produção
-docs/                            Guias de OAuth, deploy e revisão de segurança
-docker-compose.yml               Ambiente local
-docker-compose.prod.yml          Stack de produção
-.env.example                     Variáveis locais sem segredos reais
-.env.production.example          Template de produção sem segredos reais
+Navegador
+  -> Frontend React / Vite
+  -> Django REST API
+  -> PostgreSQL
+  -> Gmail API
+  -> OpenAI Responses API
+  -> Valkey + worker opcional
 ```
 
-## Como Rodar em Modo Demonstração
+O frontend nunca acessa Gmail ou OpenAI diretamente. Credenciais, tokens OAuth, chamadas externas e regras de negocio ficam no backend.
 
-Para avaliar rapidamente a interface sem Gmail real, use o modo mock do frontend.
+## Stack
 
-```bash
-cd frontend/mailguard-ai-dashboard
-npm install
-VITE_USE_MOCKS=true npm run dev
-```
+- **React + TypeScript**: interface interativa, tipada e componentizada.
+- **Vite / TanStack Router**: build moderno e roteamento client-side.
+- **TanStack Query**: cache, paginacao, refetch e invalidacao de dados.
+- **Zustand**: estado simples para conta conectada e selecao de email.
+- **Django + Django REST Framework**: API, models, migrations, admin, sessoes e middleware.
+- **PostgreSQL**: armazenamento de contas, emails, metadados e analises.
+- **Valkey**: fila e deduplicacao de analises avancadas.
+- **OpenAI SDK**: inferencia de risco com resposta estruturada.
+- **Gmail API**: leitura de mensagens com permissao minima.
+- **Docker Compose**: ambiente local e producao reproduzivel.
+- **Caddy + Nginx**: proxy reverso publico e servidor estatico do frontend em producao.
 
-O painel ficará disponível no endereço mostrado pelo Vite. Nesse modo, a UI usa emails fictícios e permite observar fluxos de lista, busca, resumo, preview e classificação de risco.
+## Pontos tecnicos de destaque
 
-## Como Rodar com Backend Real
+### Inferencia de IA
+
+A logica principal fica em `backend/api/services/openai_analysis.py`.
+
+O backend monta um payload reduzido com assunto, remetente, dominio, links, anexos, autenticacao e corpo limpo. A IA responde por um JSON Schema estrito com classificacao, score, categorias de ameaca, motivo e sinais. A resposta e normalizada pelo servidor antes de ser salva.
+
+### Gerenciamento de contexto
+
+Cada email recebe um `content_hash`, gerado a partir do payload usado na analise. Isso permite reaproveitar analises quando o conteudo nao mudou e evita chamadas repetidas para a IA. O campo `prompt_version` ajuda a controlar mudancas de comportamento quando o prompt evolui.
+
+### Fallback local
+
+Se a OpenAI estiver desativada, sem chave, com erro temporario ou limite atingido, o sistema aplica heuristicas locais. Elas observam termos suspeitos, label de spam do Gmail, anexos perigosos e outros metadados.
+
+### Seguranca
+
+- Arquivos `.env` reais sao ignorados pelo Git.
+- `.env.example` e `.env.production.example` documentam variaveis sem segredos reais.
+- Tokens OAuth ficam no banco do backend e podem ser criptografados com Fernet.
+- O app usa escopo Gmail somente leitura.
+- CORS, CSRF, cookies seguros, HSTS e headers de seguranca sao configuraveis por ambiente.
+- O preview do corpo do email usa iframe com sandbox e `no-referrer`.
+
+## Como rodar localmente
 
 1. Copie o arquivo de exemplo:
 
@@ -88,16 +82,9 @@ O painel ficará disponível no endereço mostrado pelo Vite. Nesse modo, a UI u
 cp .env.example .env
 ```
 
-2. Configure as variáveis necessárias:
+2. Preencha as variaveis locais necessarias no `.env`, especialmente as credenciais Google OAuth e, se for usar IA real, `OPENAI_API_KEY`.
 
-```env
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_OAUTH_REDIRECT_URI=http://localhost:8000/api/auth/google/callback/
-OPENAI_API_KEY=...
-```
-
-3. Suba a stack local:
+3. Suba os containers:
 
 ```bash
 docker compose up --build
@@ -107,39 +94,42 @@ docker compose up --build
 
 ```text
 Frontend: http://localhost:8080
-Backend healthcheck: http://localhost:8000/api/healthz/
+Backend:  http://localhost:8000/api/healthz/
 ```
 
-Sem `OPENAI_API_KEY`, o backend continua funcionando com classificação heurística local.
+## Variaveis de ambiente
 
-## Decisões de Segurança
+Use `.env.example` para desenvolvimento e `.env.production.example` para producao. Nunca publique arquivos `.env` reais.
 
-- O frontend chama apenas a API do backend; ele não possui segredos de Gmail ou OpenAI.
-- Tokens de acesso e refresh do Google são persistidos no backend e criptografados com `GOOGLE_TOKEN_ENCRYPTION_KEY` quando configurado.
-- O payload enviado para IA é reduzido: remetente, domínio, assunto e texto legível limitado.
-- URLs brutas são removidas do corpo antes da análise por IA para reduzir ruído e exposição desnecessária.
-- Em produção, `DEBUG=false` exige `SECRET_KEY`, `ALLOWED_HOSTS`, `POSTGRES_PASSWORD` e chave de criptografia.
-- A cópia pública remove arquivos locais de ambiente, histórico Git e artefatos gerados.
+Principais variaveis:
 
-Leia também: [PUBLICATION_SECURITY_REVIEW.md](PUBLICATION_SECURITY_REVIEW.md).
+- `SECRET_KEY`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_TOKEN_ENCRYPTION_KEY`
+- `OPENAI_API_KEY`
+- `POSTGRES_PASSWORD`
+- `VITE_API_BASE_URL`
 
-## Pontos para Avaliadores
+## Estrutura
 
-- [backend/api/services/gmail.py](backend/api/services/gmail.py): fluxo OAuth, leitura Gmail, parse de mensagens, links, anexos e cabeçalhos.
-- [backend/api/services/openai_analysis.py](backend/api/services/openai_analysis.py): prompt de segurança, JSON Schema, retry, fallback local e normalização da resposta.
-- [backend/api/fields.py](backend/api/fields.py): campo customizado para criptografia transparente de tokens.
-- [backend/api/views.py](backend/api/views.py): endpoints de sincronização, análise, resumo, revogação OAuth e regras de confiança.
-- [frontend/mailguard-ai-dashboard/src/features](frontend/mailguard-ai-dashboard/src/features): organização por funcionalidades no frontend.
-- [docs/google-oauth-verification-launch.md](docs/google-oauth-verification-launch.md): preparação para verificação OAuth do Google.
+```text
+backend/
+  api/
+    services/
+      gmail.py
+      openai_analysis.py
+      analysis_queue.py
+      trusted_senders.py
+  config/
+frontend/
+  mailguard-ai-dashboard/
+docs/
+caddy/
+docker-compose.yml
+docker-compose.prod.yml
+```
 
-## Roadmap
+## Observacoes
 
-- Autenticação própria por usuário além da beta fechada.
-- Políticas de ownership para múltiplas contas e equipes.
-- Observabilidade com métricas de análise, latência e falhas externas.
-- Testes end-to-end do fluxo Gmail/OAuth em ambiente de staging.
-- Painel administrativo para regras globais de confiança e bloqueio.
-
----
-
-Projeto criado para demonstrar capacidade full-stack aplicada a segurança, IA, privacidade, arquitetura de produto e preparo para produção.
+Este projeto foi desenvolvido como trabalho academico e portfolio tecnico. Para uso publico amplo, os proximos passos recomendados sao adicionar autenticacao propria por usuario, politicas formais de retencao de dados, backup automatizado e observabilidade de producao.

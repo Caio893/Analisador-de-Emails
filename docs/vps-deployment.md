@@ -25,7 +25,7 @@ sudo ufw enable
 sudo ufw status
 ```
 
-Do not open Postgres, Redis, Django, or the frontend container ports publicly.
+Do not open Postgres, Valkey, Django, or the frontend container ports publicly.
 
 ## 3. Copy The Project To The VPS
 

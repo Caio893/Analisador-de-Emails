@@ -1,26 +1,28 @@
+import hashlib
 import json
+import random
 import re
 import time
 from dataclasses import dataclass
 
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone
 
 from api.models import EmailAnalysis, EmailRecord
 from api.services.trusted_senders import trusted_sender_rule_for_email
 
 CLASSIFICATIONS = {"trusted", "slightly_trusted", "suspicious", "dangerous"}
+LOCAL_MODELS = {"local-heuristic", "trusted-sender-rule"}
 
 OPENAI_SYSTEM_PROMPT = (
-    "Voce e um analista de seguranca de email. Analise o pacote JSON do email. "
-    "Classifique o email como trusted, slightly_trusted, suspicious ou dangerous. "
-    "Considere spam, phishing, malware, virus, spoofing, consistencia entre "
-    "remetente/dominio e o texto legivel do corpo do email. "
-    "Os campos reason e signals devem ser escritos em portugues brasileiro, "
-    "de forma clara para usuarios no Brasil. Nao responda em ingles. "
-    "Nao afirme que um anexo e malicioso sem metadados que sustentem esse risco. "
-    "O campo body ja foi limpo para remover URLs brutas e deve ser tratado como "
-    "conteudo textual legivel, nao como lista de links."
+    "Analise o JSON de um email para seguranca. Responda apenas pelo schema. "
+    "Classifique como trusted, slightly_trusted, suspicious ou dangerous. "
+    "Use portugues brasileiro em reason e signals; nao responda em ingles. "
+    "Considere spam, phishing, "
+    "malware, virus, spoofing, dominio do remetente, dominios de links, anexos, "
+    "SPF/DKIM/DMARC quando presentes e consistencia com o corpo legivel. "
+    "Nao invente risco de anexo sem metadados. O campo body nao contem URLs brutas."
 )
 
 ANALYSIS_SCHEMA = {
@@ -81,6 +83,10 @@ def readable_text_for_ai(value: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
+def compact_header(value: object, limit: int = 300) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
 def build_analysis_payload(email: EmailRecord) -> dict[str, object]:
     metadata = email.metadata or {}
     compact_metadata = {
@@ -132,18 +138,39 @@ def sender_domain_for_email(email: EmailRecord) -> str:
 
 
 def build_openai_analysis_payload(email: EmailRecord) -> dict[str, object]:
+    metadata = email.metadata or {}
     domain = sender_domain_for_email(email)
     readable_body = readable_text_for_ai(email.body)
     return {
         "folder": email.folder,
-        "subject": email.subject,
+        "subject": email.subject[:300],
         "sender": {
             "name": email.from_name,
             "email": email.from_email,
         },
         "domain": domain,
-        "body": limit_text(readable_body, settings.GMAIL_BODY_CHAR_LIMIT),
+        "links": {
+            "count": metadata.get("link_count", 0),
+            "domains": (metadata.get("link_domains") or [])[:8],
+        },
+        "attachments": {
+            "count": email.attachment_count,
+            "filenames": (metadata.get("attachment_filenames") or [])[:6],
+            "mime_types": (metadata.get("attachment_mime_types") or [])[:6],
+            "dangerous_extensions": metadata.get("dangerous_attachment_extensions", []),
+        },
+        "auth": {
+            "spf": compact_header(metadata.get("spf_result"), 300),
+            "authentication_results": compact_header(metadata.get("authentication_results"), 500),
+        },
+        "body": limit_text(readable_body, settings.OPENAI_BODY_CHAR_LIMIT),
     }
+
+
+def analysis_content_hash(email: EmailRecord) -> str:
+    payload = build_openai_analysis_payload(email)
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def heuristic_analysis(email: EmailRecord, reason_prefix: str = "") -> AnalysisResult:
@@ -306,17 +333,67 @@ def create_response_with_retry(client, *, model: str, input_messages: list[dict[
                         "schema": ANALYSIS_SCHEMA,
                     }
                 },
+                max_output_tokens=settings.OPENAI_MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:
             if attempt >= attempts - 1 or not retryable_openai_error(exc):
                 raise
-            time.sleep(base_delay * (2**attempt))
+            delay = base_delay * (2**attempt)
+            if delay:
+                delay *= 1 + random.random()
+            time.sleep(delay)
 
 
 def friendly_openai_failure(exc: Exception) -> str:
     if exc.__class__.__name__ == "RateLimitError":
         return "A analise avancada atingiu um limite temporario."
     return "A analise avancada nao pode ser concluida agora."
+
+
+def advanced_analysis_count_today(account) -> int:
+    today = timezone.now().date()
+    return EmailAnalysis.objects.filter(
+        email__account=account,
+        analyzed_at__date=today,
+    ).exclude(model__in=LOCAL_MODELS).count()
+
+
+def daily_analysis_limit_reached(email: EmailRecord) -> bool:
+    limit = settings.OPENAI_DAILY_ANALYSIS_LIMIT
+    return limit > 0 and advanced_analysis_count_today(email.account) >= limit
+
+
+def reusable_analysis_for_hash(
+    email: EmailRecord,
+    *,
+    model: str,
+    content_hash: str,
+) -> EmailAnalysis | None:
+    if not content_hash:
+        return None
+
+    prompt_version = settings.OPENAI_PROMPT_VERSION
+    current = getattr(email, "analysis", None)
+    if (
+        current
+        and current.status == EmailAnalysis.Status.COMPLETED
+        and current.model == model
+        and current.content_hash == content_hash
+        and current.prompt_version == prompt_version
+    ):
+        return current
+
+    return (
+        EmailAnalysis.objects.select_related("email")
+        .filter(
+            email__account=email.account,
+            content_hash=content_hash,
+            prompt_version=prompt_version,
+            status=EmailAnalysis.Status.COMPLETED,
+        )
+        .exclude(Q(model__in=LOCAL_MODELS) | Q(email=email))
+        .first()
+    )
 
 
 def analyze_with_openai(email: EmailRecord, *, bulk: bool = True) -> AnalysisResult:
@@ -329,6 +406,9 @@ def analyze_with_openai(email: EmailRecord, *, bulk: bool = True) -> AnalysisRes
 
     if not settings.OPENAI_API_KEY:
         return heuristic_analysis(email, "A chave da OpenAI nao esta configurada.")
+
+    if daily_analysis_limit_reached(email):
+        return heuristic_analysis(email, "O limite diario de analises avancadas foi atingido.")
 
     from openai import OpenAI
 
@@ -356,6 +436,12 @@ def analyze_with_openai(email: EmailRecord, *, bulk: bool = True) -> AnalysisRes
 
 
 def save_analysis_result(email: EmailRecord, result: AnalysisResult) -> EmailAnalysis:
+    content_hash = analysis_content_hash(email)
+    status = (
+        EmailAnalysis.Status.LOCAL
+        if result.model in LOCAL_MODELS
+        else EmailAnalysis.Status.COMPLETED
+    )
     analysis, _ = EmailAnalysis.objects.update_or_create(
         email=email,
         defaults={
@@ -367,9 +453,16 @@ def save_analysis_result(email: EmailRecord, result: AnalysisResult) -> EmailAna
                 "threat_categories": result.threat_categories,
             },
             "model": result.model,
+            "status": status,
+            "content_hash": content_hash,
+            "prompt_version": settings.OPENAI_PROMPT_VERSION,
+            "last_error": "",
             "analyzed_at": timezone.now(),
         },
     )
+    if email.content_hash != content_hash:
+        email.content_hash = content_hash
+        email.save(update_fields=["content_hash", "updated_at"])
     return analysis
 
 
@@ -384,13 +477,61 @@ def analyze_email_locally(email: EmailRecord, *, force: bool = False) -> EmailAn
     return save_analysis_result(email, result)
 
 
+def copy_cached_analysis(email: EmailRecord, cached: EmailAnalysis, *, content_hash: str) -> EmailAnalysis:
+    analysis, _ = EmailAnalysis.objects.update_or_create(
+        email=email,
+        defaults={
+            "risk": cached.risk,
+            "risk_score": cached.risk_score,
+            "reason": cached.reason,
+            "signals": cached.signals,
+            "model": cached.model,
+            "status": EmailAnalysis.Status.COMPLETED,
+            "content_hash": content_hash,
+            "prompt_version": cached.prompt_version or settings.OPENAI_PROMPT_VERSION,
+            "last_error": "",
+            "analyzed_at": timezone.now(),
+        },
+    )
+    if email.content_hash != content_hash:
+        email.content_hash = content_hash
+        email.save(update_fields=["content_hash", "updated_at"])
+    return analysis
+
+
 def analyze_email(email: EmailRecord, *, force: bool = False, bulk: bool = True) -> EmailAnalysis:
+    model = settings.OPENAI_BULK_MODEL if bulk else settings.OPENAI_MODEL
+    content_hash = analysis_content_hash(email)
+    cached = reusable_analysis_for_hash(email, model=model, content_hash=content_hash)
+    if cached and (force or not hasattr(email, "analysis") or cached.email_id == email.pk):
+        return cached if cached.email_id == email.pk else copy_cached_analysis(email, cached, content_hash=content_hash)
+
     if not force and hasattr(email, "analysis"):
-        return email.analysis
+        current = email.analysis
+        if current.status in {EmailAnalysis.Status.QUEUED, EmailAnalysis.Status.RUNNING}:
+            return current
+        if current.model not in LOCAL_MODELS:
+            if not current.content_hash:
+                current.content_hash = content_hash
+                current.prompt_version = current.prompt_version or settings.OPENAI_PROMPT_VERSION
+                current.status = current.status or EmailAnalysis.Status.COMPLETED
+                current.save(update_fields=["content_hash", "prompt_version", "status", "updated_at"])
+                if email.content_hash != content_hash:
+                    email.content_hash = content_hash
+                    email.save(update_fields=["content_hash", "updated_at"])
+                return current
+            if current.content_hash == content_hash:
+                return current
 
     try:
         result = analyze_with_openai(email, bulk=bulk)
     except Exception as exc:
         result = heuristic_analysis(email, friendly_openai_failure(exc))
+        analysis = save_analysis_result(email, result)
+        analysis.status = EmailAnalysis.Status.FAILED
+        analysis.last_error = str(exc)[:1000]
+        analysis.attempts += 1
+        analysis.save(update_fields=["status", "last_error", "attempts", "updated_at"])
+        return analysis
 
     return save_analysis_result(email, result)

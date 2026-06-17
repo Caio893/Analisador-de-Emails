@@ -60,6 +60,12 @@ class EmailRecordSerializer(serializers.ModelSerializer):
     def get_aiReason(self, instance: EmailRecord) -> str:
         if not hasattr(instance, "analysis"):
             return "Analise local ainda nao disponivel."
+        if instance.analysis.status == "queued":
+            return "Analise avancada enfileirada."
+        if instance.analysis.status == "running":
+            return "Analise avancada em andamento."
+        if instance.analysis.status == "failed":
+            return "A analise avancada falhou. A classificacao local foi mantida."
         if instance.analysis.model == "local-heuristic" and instance.analysis.reason.startswith(
             "Basic local scan only."
         ):
@@ -72,6 +78,8 @@ class EmailRecordSerializer(serializers.ModelSerializer):
     def get_analysisStatus(self, instance: EmailRecord) -> str:
         if not hasattr(instance, "analysis"):
             return "pending"
+        if instance.analysis.status in {"queued", "running"}:
+            return "pending"
         if instance.analysis.model in {"local-heuristic", "trusted-sender-rule"}:
             return "local"
         return "analyzed"
@@ -81,3 +89,12 @@ class EmailRecordSerializer(serializers.ModelSerializer):
         if not rule:
             return None
         return {"ruleType": rule.rule_type, "value": rule.value}
+
+
+class EmailRecordListSerializer(EmailRecordSerializer):
+    class Meta(EmailRecordSerializer.Meta):
+        fields = [
+            field
+            for field in EmailRecordSerializer.Meta.fields
+            if field not in {"body", "metadata", "trustedRule"}
+        ]

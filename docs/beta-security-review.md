@@ -7,7 +7,7 @@ Status: acceptable for a small closed beta after production secrets, DNS, HTTPS,
 - `DEBUG=false` is in the production example.
 - Django now requires `SECRET_KEY`, `ALLOWED_HOSTS`, and `POSTGRES_PASSWORD` when `DEBUG=false`.
 - Caddy is the only intended public entrypoint on ports 80 and 443.
-- Production Postgres and Redis do not publish host ports.
+- Production Postgres and Valkey do not publish host ports.
 - Backend and frontend host bindings default to `127.0.0.1`, so they are not public on the VPS.
 - Frontend production serving uses nginx static files instead of the Vite dev server.
 - Closed beta Basic Auth protects both frontend and backend API, with health endpoints kept available for container checks.
@@ -19,7 +19,7 @@ Status: acceptable for a small closed beta after production secrets, DNS, HTTPS,
 - Production can disable account selection through `X-Mailguard-Account`; the backend then uses the Django session set during OAuth callback.
 - Profile controls include local session disconnect, OAuth token revocation attempt, Google permissions link, and active local data deletion.
 - OpenAI analysis has cache reuse, queue deduplication, retry handling, daily limits, and local heuristic fallback.
-- No real OpenAI key, Google secret, Django secret, beta password, or database password was found in the public-copy scan after excluding local environment files.
+- No real OpenAI key, Google secret, Django secret, beta password, or database password was found in the project scan.
 
 ## Remaining Risks
 

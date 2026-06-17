@@ -2,7 +2,7 @@ import base64
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from email.utils import parseaddr
 from urllib.parse import urlencode, unquote, urlparse
 from urllib.error import HTTPError, URLError
@@ -14,14 +14,28 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 
-from api.models import EmailRecord, GoogleAccount
-from api.services.openai_analysis import analyze_email_locally
+from api.models import EmailAnalysis, EmailRecord, GoogleAccount
+from api.services.analysis_queue import enqueue_email_analysis
+from api.services.openai_analysis import analysis_content_hash, analyze_email_locally
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 FOLDER_LABELS = {
     EmailRecord.Folder.INBOX: "INBOX",
     EmailRecord.Folder.SPAM: "SPAM",
 }
+LABEL_FOLDERS = {label: folder for folder, label in FOLDER_LABELS.items()}
+GMAIL_LIST_FIELDS = "messages(id,threadId),nextPageToken,resultSizeEstimate"
+GMAIL_MESSAGE_FIELDS = (
+    "id,threadId,historyId,labelIds,snippet,internalDate,sizeEstimate,payload"
+)
+GMAIL_HISTORY_FIELDS = (
+    "history(id,messagesAdded(message(id,threadId,labelIds)),"
+    "messagesDeleted(message(id,threadId,labelIds)),"
+    "labelsAdded(message(id,threadId,labelIds),labelIds),"
+    "labelsRemoved(message(id,threadId,labelIds),labelIds)),"
+    "historyId,nextPageToken"
+)
+GMAIL_DISPLAY_FIELDS = "id,payload"
 URL_RE = re.compile(r"https?://[^\s<>\")']+", re.IGNORECASE)
 DANGEROUS_EXTENSIONS = {
     ".bat",
@@ -44,6 +58,10 @@ class EmailDisplayContent:
     html: str = ""
     text: str = ""
     source: str = "gmail"
+
+
+class GmailHistoryLimitExceeded(Exception):
+    pass
 
 
 def oauth_flow_class():
@@ -138,9 +156,13 @@ def credentials_for_account(account: GoogleAccount):
 
 
 def build_gmail_service_from_credentials(credentials):
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
 
-    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    http = httplib2.Http(timeout=settings.GOOGLE_API_TIMEOUT_SECONDS)
+    authed_http = AuthorizedHttp(credentials, http=http)
+    return build("gmail", "v1", http=authed_http, cache_discovery=False)
 
 
 def build_gmail_service(account: GoogleAccount):
@@ -382,7 +404,7 @@ def fetch_email_display_content(account: GoogleAccount, gmail_id: str) -> EmailD
     message = (
         service.users()
         .messages()
-        .get(userId="me", id=gmail_id, format="full")
+        .get(userId="me", id=gmail_id, format="full", fields=GMAIL_DISPLAY_FIELDS)
         .execute()
     )
     return extract_display_content_from_payload(
@@ -429,6 +451,7 @@ def parse_gmail_message(message: dict, folder: str) -> dict:
     return {
         "gmail_id": message["id"],
         "thread_id": message.get("threadId", ""),
+        "gmail_history_id": str(message.get("historyId", "")),
         "folder": folder,
         "from_name": from_name or from_email,
         "from_email": from_email,
@@ -444,26 +467,207 @@ def parse_gmail_message(message: dict, folder: str) -> dict:
     }
 
 
-def iter_messages(service, folder: str, max_results: int) -> Iterable[dict]:
+def list_message_refs(
+    service,
+    folder: str,
+    max_results: int,
+    *,
+    query: str = "",
+) -> list[dict]:
     label = FOLDER_LABELS[folder]
-    response = (
+    refs: list[dict] = []
+    page_token = None
+
+    while len(refs) < max_results:
+        remaining = max_results - len(refs)
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                labelIds=[label],
+                maxResults=min(remaining, 500),
+                pageToken=page_token,
+                q=query or None,
+                includeSpamTrash=folder == EmailRecord.Folder.SPAM,
+                fields=GMAIL_LIST_FIELDS,
+            )
+            .execute()
+        )
+        refs.extend(response.get("messages", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return refs[:max_results]
+
+
+def get_message(service, gmail_id: str) -> dict:
+    return (
         service.users()
         .messages()
-        .list(
+        .get(userId="me", id=gmail_id, format="full", fields=GMAIL_MESSAGE_FIELDS)
+        .execute()
+    )
+
+
+def batch_get_messages(service, gmail_ids: list[str], batch_size: int = 50) -> list[dict]:
+    if not gmail_ids:
+        return []
+
+    if not hasattr(service, "new_batch_http_request"):
+        return [get_message(service, gmail_id) for gmail_id in gmail_ids]
+
+    messages_by_id: dict[str, dict] = {}
+
+    for start in range(0, len(gmail_ids), batch_size):
+        chunk = gmail_ids[start : start + batch_size]
+
+        def callback(request_id, response, exception):
+            if exception:
+                return
+            messages_by_id[str(request_id)] = response
+
+        batch = service.new_batch_http_request(callback=callback)
+        for gmail_id in chunk:
+            request = (
+                service.users()
+                .messages()
+                .get(userId="me", id=gmail_id, format="full", fields=GMAIL_MESSAGE_FIELDS)
+            )
+            batch.add(request, request_id=gmail_id)
+        batch.execute()
+
+    return [messages_by_id[gmail_id] for gmail_id in gmail_ids if gmail_id in messages_by_id]
+
+
+def iter_messages(service, folder: str, max_results: int) -> Iterable[dict]:
+    refs = list_message_refs(service, folder, max_results, query=settings.GMAIL_SYNC_QUERY)
+    ids = [item["id"] for item in refs]
+    yield from batch_get_messages(service, ids)
+
+
+def folder_from_labels(label_ids: Iterable[str], default: str | None = None) -> str | None:
+    labels = set(label_ids or [])
+    if FOLDER_LABELS[EmailRecord.Folder.SPAM] in labels:
+        return EmailRecord.Folder.SPAM
+    if FOLDER_LABELS[EmailRecord.Folder.INBOX] in labels:
+        return EmailRecord.Folder.INBOX
+    return default if default in FOLDER_LABELS else None
+
+
+def current_mailbox_history_id(service) -> str:
+    try:
+        profile = service.users().getProfile(userId="me", fields="historyId").execute()
+    except TypeError:
+        profile = service.users().getProfile(userId="me").execute()
+    return str(profile.get("historyId", ""))
+
+
+def parse_watch_expiration(value: str | int | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=dt_timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def refresh_gmail_watch(account: GoogleAccount, service) -> bool:
+    if not settings.GMAIL_WATCH_TOPIC:
+        return False
+
+    renew_after = timezone.now() + timedelta(hours=settings.GMAIL_WATCH_RENEWAL_HOURS)
+    if account.gmail_watch_expiration and account.gmail_watch_expiration > renew_after:
+        return False
+
+    response = (
+        service.users()
+        .watch(
             userId="me",
-            labelIds=[label],
-            maxResults=max_results,
-            includeSpamTrash=folder == EmailRecord.Folder.SPAM,
+            body={
+                "topicName": settings.GMAIL_WATCH_TOPIC,
+                "labelIds": list(FOLDER_LABELS.values()),
+                "labelFilterBehavior": "INCLUDE",
+            },
+            fields="historyId,expiration",
         )
         .execute()
     )
-    for item in response.get("messages", []):
-        yield (
+    account.gmail_history_id = str(response.get("historyId") or account.gmail_history_id or "")
+    account.gmail_watch_expiration = parse_watch_expiration(response.get("expiration"))
+    account.save(update_fields=["gmail_history_id", "gmail_watch_expiration", "updated_at"])
+    return True
+
+
+def history_message_ids(
+    service,
+    start_history_id: str,
+    folders: Iterable[str],
+    *,
+    max_changes: int | None = None,
+) -> tuple[list[str], str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    page_token = None
+    latest_history_id = start_history_id
+    change_limit = settings.GMAIL_HISTORY_MAX_CHANGES if max_changes is None else max_changes
+
+    while True:
+        response = (
             service.users()
-            .messages()
-            .get(userId="me", id=item["id"], format="full")
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=start_history_id,
+                historyTypes=["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
+                maxResults=500,
+                pageToken=page_token,
+                fields=GMAIL_HISTORY_FIELDS,
+            )
             .execute()
         )
+        latest_history_id = str(response.get("historyId") or latest_history_id or "")
+        for history in response.get("history", []):
+            latest_history_id = str(history.get("id") or latest_history_id)
+            for bucket in ("messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"):
+                for entry in history.get(bucket, []) or []:
+                    message = entry.get("message") or {}
+                    gmail_id = message.get("id")
+                    if not gmail_id or gmail_id in seen:
+                        continue
+                    seen.add(gmail_id)
+                    ids.append(gmail_id)
+                    if change_limit > 0 and len(ids) >= change_limit:
+                        raise GmailHistoryLimitExceeded(
+                            f"Gmail history exceeded {change_limit} changed messages."
+                        )
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return ids, latest_history_id
+
+
+def delete_local_message(account: GoogleAccount, gmail_id: str, folders: Iterable[str]) -> int:
+    queryset = EmailRecord.objects.filter(
+        account=account,
+        gmail_id=gmail_id,
+        folder__in=tuple(folders),
+    )
+    count = queryset.count()
+    queryset.delete()
+    return count
+
+
+def delete_stale_folder_messages(account: GoogleAccount, folder: str, current_gmail_ids: set[str]) -> int:
+    queryset = EmailRecord.objects.filter(account=account, folder=folder)
+    if current_gmail_ids:
+        queryset = queryset.exclude(gmail_id__in=current_gmail_ids)
+    count = queryset.count()
+    queryset.delete()
+    return count
 
 
 def sync_account_emails(
@@ -473,27 +677,142 @@ def sync_account_emails(
 ) -> dict[str, int]:
     service = build_gmail_service(account)
     limit = max_results or settings.GMAIL_SYNC_MAX_RESULTS
+    folders = tuple(folder for folder in folders if folder in FOLDER_LABELS)
     synced = 0
     local_analyzed = 0
+    queued = 0
+    removed = 0
+
+    def persist_message(message: dict, folder: str) -> tuple[bool, bool, bool]:
+        parsed = parse_gmail_message(message, folder)
+        email, created = EmailRecord.objects.update_or_create(
+            account=account,
+            gmail_id=parsed["gmail_id"],
+            defaults=parsed,
+        )
+        content_hash = analysis_content_hash(email)
+        if email.content_hash != content_hash:
+            email.content_hash = content_hash
+            email.save(update_fields=["content_hash", "updated_at"])
+
+        did_local = False
+        did_queue = False
+        if not email.hidden_at:
+            analysis = getattr(email, "analysis", None)
+            status = getattr(analysis, "status", "")
+            if created or not analysis:
+                analyze_email_locally(email)
+                did_local = True
+            elif (
+                analysis.model == "local-heuristic"
+                and analysis.content_hash
+                and analysis.content_hash != content_hash
+                and status not in {EmailAnalysis.Status.QUEUED, EmailAnalysis.Status.RUNNING}
+            ):
+                analyze_email_locally(email, force=True)
+                did_local = True
+
+            if settings.ANALYSIS_QUEUE_AUTO_ENQUEUE:
+                email = EmailRecord.objects.select_related("analysis").get(pk=email.pk)
+                did_queue = enqueue_email_analysis(email)
+
+        return created, did_local, did_queue
+
+    def reconcile_folder(folder: str, *, fetch_all: bool = False) -> tuple[int, int, int, int]:
+        refs = list_message_refs(service, folder, limit, query=settings.GMAIL_SYNC_QUERY)
+        current_gmail_ids = [item["id"] for item in refs if item.get("id")]
+        current_gmail_id_set = set(current_gmail_ids)
+        ids_to_fetch = current_gmail_ids
+
+        if not fetch_all:
+            existing_ids = set(
+                EmailRecord.objects.filter(
+                    account=account,
+                    folder=folder,
+                    gmail_id__in=current_gmail_ids,
+                ).values_list("gmail_id", flat=True)
+            )
+            ids_to_fetch = [gmail_id for gmail_id in current_gmail_ids if gmail_id not in existing_ids]
+
+        folder_synced = 0
+        folder_local_analyzed = 0
+        folder_queued = 0
+        if ids_to_fetch:
+            for message in batch_get_messages(service, ids_to_fetch):
+                _, did_local, did_queue = persist_message(message, folder)
+                folder_synced += 1
+                folder_local_analyzed += int(did_local)
+                folder_queued += int(did_queue)
+
+        folder_removed = delete_stale_folder_messages(account, folder, current_gmail_id_set)
+        return folder_synced, folder_local_analyzed, folder_queued, folder_removed
+
+    reconciled_folders: set[str] = set()
+
+    try:
+        if account.gmail_history_id:
+            ids, latest_history_id = history_message_ids(service, account.gmail_history_id, folders)
+            if ids:
+                messages_by_id = {message["id"]: message for message in batch_get_messages(service, ids)}
+                for gmail_id in ids:
+                    message = messages_by_id.get(gmail_id)
+                    if not message:
+                        removed += delete_local_message(account, gmail_id, folders)
+                        continue
+
+                    folder = folder_from_labels(message.get("labelIds") or [])
+                    if folder and folder in folders:
+                        _, did_local, did_queue = persist_message(message, folder)
+                        synced += 1
+                        local_analyzed += int(did_local)
+                        queued += int(did_queue)
+                    else:
+                        removed += delete_local_message(account, gmail_id, folders)
+            if latest_history_id:
+                account.gmail_history_id = latest_history_id
+        else:
+            raise ValueError("No Gmail history checkpoint available.")
+    except Exception as exc:
+        if exc.__class__.__name__ != "HttpError" or getattr(getattr(exc, "resp", None), "status", None) == 404:
+            account.gmail_history_id = ""
+        for folder in folders:
+            folder_synced, folder_local_analyzed, folder_queued, folder_removed = reconcile_folder(
+                folder,
+                fetch_all=True,
+            )
+            synced += folder_synced
+            local_analyzed += folder_local_analyzed
+            queued += folder_queued
+            removed += folder_removed
+            reconciled_folders.add(folder)
+        try:
+            account.gmail_history_id = current_mailbox_history_id(service) or account.gmail_history_id
+        except Exception:
+            pass
 
     for folder in folders:
-        if folder not in FOLDER_LABELS:
+        if folder in reconciled_folders:
             continue
+        try:
+            folder_synced, folder_local_analyzed, folder_queued, folder_removed = reconcile_folder(folder)
+        except Exception:
+            continue
+        synced += folder_synced
+        local_analyzed += folder_local_analyzed
+        queued += folder_queued
+        removed += folder_removed
 
-        for message in iter_messages(service, folder, limit):
-            parsed = parse_gmail_message(message, folder)
-            email, created = EmailRecord.objects.update_or_create(
-                account=account,
-                gmail_id=parsed["gmail_id"],
-                defaults=parsed,
-            )
-            synced += 1
-            if email.hidden_at:
-                continue
-            if created or not hasattr(email, "analysis"):
-                analyze_email_locally(email)
-                local_analyzed += 1
+    try:
+        refresh_gmail_watch(account, service)
+    except Exception:
+        pass
 
     account.last_synced_at = timezone.now()
-    account.save(update_fields=["last_synced_at", "updated_at"])
-    return {"synced": synced, "analyzed": 0, "localAnalyzed": local_analyzed, "queued": 0}
+    account.save(update_fields=["last_synced_at", "gmail_history_id", "updated_at"])
+    return {
+        "synced": synced,
+        "analyzed": 0,
+        "localAnalyzed": local_analyzed,
+        "queued": queued,
+        "removed": removed,
+    }
